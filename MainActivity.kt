@@ -149,7 +149,10 @@
         </div>
     </div>
 <script>
-let githubToken='', selectedRepo=null, uploadedFiles=[], defaultBranch='main', detectedProjectType=null, lastDownloadUrl=null;
+let githubToken='', selectedRepo=null, uploadedFiles=[], defaultBranch='main', detectedProjectType=null, lastDownloadUrl=null, lastApkBlob=null;
+try{ const sf=localStorage.getItem('uploadedFiles_v7'); if(sf){ const parsed=JSON.parse(sf); if(Array.isArray(parsed)) uploadedFiles=parsed; } }catch{}
+function saveFiles(){ try{ localStorage.setItem('uploadedFiles_v7', JSON.stringify(uploadedFiles.slice(0,30))); }catch{} }
+
 const API='https://api.github.com';
 function log(m){ const b=document.getElementById('logBox'); b.style.display='block'; b.innerHTML+=m+"<br>"; b.scrollTop=b.scrollHeight; }
 function showStatus(id,msg,type){ const el=document.getElementById(id); el.innerHTML=msg; el.className='status-message '+type; }
@@ -184,11 +187,17 @@ async function handleZipUpload(e){
     }
     const zip=await JSZip.loadAsync(file);
     let c=0;
-    for(const [path, entry] of Object.entries(zip.files)){
+    for(const [rawPath, entry] of Object.entries(zip.files)){
       if(entry.dir) continue;
-      const content=await entry.async('base64');
-      uploadedFiles.push({name:path, content, size:content.length*0.75, isBinary:isBinaryFile(path)});
-      c++;
+      let path = rawPath.replace(/\\/g,'/').trim().replace(/^\/+/, '');
+      if(!path || path.includes('__MACOSX') || path.startsWith('.') || path.includes('/.')) continue;
+      if(path.length>200) continue;
+      try{
+        const content=await entry.async('base64');
+        if(!content || content.length<1) continue;
+        uploadedFiles.push({name:path, content, size:content.length*0.75, isBinary:isBinaryFile(path)});
+        c++;
+      }catch(e){ log('⚠️ تخطي ملف تالف: '+rawPath); }
     }
     if(c==0) throw new Error('ZIP فاضي من الداخل');
     renderFileList(); analyzeProject();
@@ -198,9 +207,9 @@ async function handleZipUpload(e){
 
 function processCode(){ const code=document.getElementById('codeInput').value; const fn=document.getElementById('codeFileName').value.trim(); if(!code.trim()) return showStatus('uploadStatus','أدخل الكود','error'); if(!fn) return showStatus('uploadStatus','أدخل اسم الملف','error'); const b64=btoa(unescape(encodeURIComponent(code))); uploadedFiles.push({name:fn, content:b64, size:code.length, isBinary:false}); renderFileList(); analyzeProject(); showStatus('uploadStatus',`✅ ${fn}`,'success'); }
 function previewCode(){ const code=document.getElementById('codeInput').value; const p=document.getElementById('filePreview'); if(!code.trim()){ p.classList.remove('show'); return; } p.textContent=code.slice(0,3000); p.classList.add('show'); }
-function renderFileList(){ const list=document.getElementById('fileList'); list.innerHTML=''; uploadedFiles.forEach((f,i)=>{ const d=document.createElement('div'); d.className='file-item'; d.innerHTML=`<span>${f.name}</span><span>${formatSize(f.size)}</span><button class="btn btn-danger" style="padding:2px 8px" onclick="removeFile(${i})">x</button>`; list.appendChild(d); }); }
-function removeFile(i){ uploadedFiles.splice(i,1); renderFileList(); }
-function clearAllFiles(){ uploadedFiles=[]; renderFileList(); document.getElementById('projectInfo').classList.remove('show'); showStatus('uploadStatus','تم المسح','info'); }
+function renderFileList(){ const list=document.getElementById('fileList'); list.innerHTML=''; uploadedFiles.forEach((f,i)=>{ const d=document.createElement('div'); d.className='file-item'; d.innerHTML=`<span>📄 ${f.name}</span><span>${formatSize(f.size)}</span><button class="btn btn-danger" style="padding:2px 8px" onclick="removeFile(${i})">x</button>`; list.appendChild(d); }); saveFiles(); }
+function removeFile(i){ uploadedFiles.splice(i,1); saveFiles(); renderFileList(); }
+function clearAllFiles(){ uploadedFiles=[]; localStorage.removeItem('uploadedFiles_v7'); renderFileList(); document.getElementById('projectInfo').classList.remove('show'); showStatus('uploadStatus','تم المسح','info'); }
 function analyzeProject(){
   if(!uploadedFiles.length) return showStatus('uploadStatus','لا ملفات','error');
   const names=uploadedFiles.map(f=>f.name.toLowerCase());
@@ -219,12 +228,49 @@ function analyzeProject(){
 }
 
 // ======== الرفع والبناء المصحح ========
-async function uploadFileToRepo(path, content){
+async function uploadFileToRepo(rawPath, content){
+  // تنظيف المسار - هذا سبب الخطأ اللي شفته
+  let path = rawPath.replace(/\\/g,'/').trim().replace(/^\/+/, '').replace(/\/{2,}/g,'/');
+  if(!path || path==='.' || path.endsWith('/')) throw new Error(`مسار غير صالح: ${rawPath}`);
+  if(path.includes('..')) path = path.replace(/\.\.\//g,'');
+  
   const apiPath=`/repos/${selectedRepo.full_name}/contents/${encodeURIComponent(path).replace(/%2F/g,'/')}`;
   let sha=null;
-  try{ const existing=await githubFetch(apiPath+`?ref=${defaultBranch}`); sha=existing.sha; }catch{}
-  const body={message:`Add ${path}`, content, branch:defaultBranch}; if(sha) body.sha=sha;
-  await githubFetch(apiPath,{method:'PUT', body:JSON.stringify(body)});
+  // حاول تجيب sha بدون ما يطلع خطأ "file not found"
+  try{
+    const existing = await fetch(API+apiPath+`?ref=${encodeURIComponent(defaultBranch)}`, {
+      headers:{'Authorization':`Bearer ${githubToken}`,'Accept':'application/vnd.github.v3+json'}
+    });
+    if(existing.ok){
+      const j=await existing.json();
+      sha=j.sha;
+    }
+    // إذا 404 يعني ملف جديد - عادي
+  }catch(e){ /* ملف جديد */ }
+  
+  const body={message:`Add ${path} via V8`, content, branch:defaultBranch};
+  if(sha) body.sha=sha;
+  
+  // إعادة محاولة مع انتظار إذا المستودع جديد
+  for(let attempt=1; attempt<=3; attempt++){
+    try{
+      await githubFetch(apiPath,{method:'PUT', body:JSON.stringify(body)});
+      return;
+    }catch(err){
+      if(err.message.includes('could not be found') && attempt<3){
+        log(`⏳ انتظار تجهيز المستودع... محاولة ${attempt}`);
+        await new Promise(r=>setTimeout(r, 2000*attempt));
+        // حدث defaultBranch
+        try{
+          const repoData=await githubFetch(`/repos/${selectedRepo.full_name}`);
+          defaultBranch=repoData.default_branch||'main';
+          body.branch=defaultBranch;
+        }catch{}
+      } else {
+        throw err;
+      }
+    }
+  }
 }
 
 function generateWorkflow(){
@@ -312,14 +358,41 @@ async function startBuild(){
   const btn=document.getElementById('buildBtn'); btn.disabled=true; btn.innerHTML='<span class="spinner"></span> جاري البناء...';
   try{
     log('🔍 تحديد الفرع...');
-    const repoData=await githubFetch(`/repos/${selectedRepo.full_name}`);
-    defaultBranch=repoData.default_branch||'main';
-    log('📤 رفع '+uploadedFiles.length+' ملف...');
-    for(const f of uploadedFiles){
-      if(f.size>80*1024*1024){ log('⚠️ تخطي كبير: '+f.name); continue; }
-      await uploadFileToRepo(f.name, f.content);
-      log('✅ '+f.name);
+    // انتظار إذا المستودع جديد
+    await new Promise(r=>setTimeout(r,1500));
+    try{
+      const repoData=await githubFetch(`/repos/${selectedRepo.full_name}`);
+      defaultBranch=repoData.default_branch||'main';
+      log('✅ الفرع: '+defaultBranch);
+    }catch(e){
+      defaultBranch='main';
+      log('⚠️ استخدام main كافتراضي');
     }
+    // إذا المستودع جديد جداً، انتظر ثانيتين
+    if(!selectedRepo.default_branch){
+      log('⏳ مستودع جديد - انتظار تجهيزه...');
+      await new Promise(r=>setTimeout(r,3000));
+    }
+    log('📤 رفع '+uploadedFiles.length+' ملف إلى GitHub الرسمي...');
+    let okCount=0, skipCount=0;
+    for(const f of uploadedFiles){
+      if(!f.content || f.content.length<2){ log('⚠️ تخطي فاضي: '+f.name); skipCount++; continue; }
+      if(f.size>90*1024*1024){ log('⚠️ كبير جداً (>90MB) تخطي: '+f.name); skipCount++; continue; }
+      try{
+        await uploadFileToRepo(f.name, f.content);
+        log('✅ '+f.name);
+        okCount++;
+      }catch(err){
+        log('❌ فشل '+f.name+': '+err.message.slice(0,120));
+        if(err.message.includes('could not be found')){
+          log('💡 السبب: مسار الملف غير صالح أو المستودع جديد - تم إصلاحه في V8');
+        }
+        // لا توقف كل الرفع إذا ملف واحد فشل
+      }
+      await new Promise(r=>setTimeout(r,300)); // تهدئة لتجنب Rate limit
+    }
+    log(`📊 تم رفع ${okCount} / ${uploadedFiles.length} (تخطي ${skipCount})`);
+    if(okCount===0) throw new Error('فشل رفع كل الملفات - تأكد أن ZIP يحتوي ملفات صالحة وليس مجلدات فاضية');
     log('📝 إنشاء workflow مصحح...');
     const wf=generateWorkflow();
     await uploadFileToRepo('.github/workflows/build.yml', btoa(unescape(encodeURIComponent(wf))));
@@ -398,5 +471,13 @@ async function downloadArtifactWithRetry(runId){
   }
 }
 </script>
+<div style="margin:20px;padding:15px;background:#020617;border:1px solid #22c55e;border-radius:10px;font-size:12px;color:#94a3b8">
+<h3 style="color:#22c55e">🔒 هل GitHub رسمي؟</h3>
+<p>نعم، هذا هو GitHub الرسمي <b>https://github.com</b> مملوك لشركة مايكروسوفت. موقعي لا يصمم GitHub، فقط يستخدم واجهة برمجة التطبيقات الرسمية <b>api.github.com</b>.</p>
+<p>✅ تقدر تتأكد: افتح متصفح Chrome واكتب <b>github.com/h6566924-sys</b> بيدك - بتشوف نفس المستودعات.<br>
+✅ التوكن يبقى في جوالك فقط (localStorage) ولا يرسل لي أبداً.<br>
+✅ رابط التحميل دائماً يبدأ بـ <b>github.com/اسمك</b> وليس موقع غريب.</p>
+<p style="color:#fbbf24">⚠️ GitHub بالإنجليزي لأنه موقع أمريكي، لكن أزرار التحميل واضحة: Artifacts → app-apk.zip → ثم فك الضغط بتحصل APK.</p>
+</div>
 <script>(function(){var loc=location.href.replace(/#.*$/,"");var ATTR_NAMES=["data-product-id","data-productid","data-product_id","product-id","productid","product_id","data-source-entity-id","source-entity-id","source_entity_id","data-product","data-metadata","data-meta"];var DATASET_KEYS=["productId","productid","product_id","sourceEntityId","sourceentityid","source_entity_id","product","metadata","meta"];function readProductId(value){if(typeof value!=="string"||value.length===0)return null;if(/^[0-9]{6,}$/.test(value))return value;var match=value.match(/(?:product(?:_|-)?id|source(?:_|-)?entity(?:_|-)?id)["'=:\s]+([0-9]{6,})/i);return match?match[1]:null}function extractProductId(start){for(var node=start;node&&node!==document.body;node=node.parentElement){for(var i=0;i<ATTR_NAMES.length;i++){var attrValue=node.getAttribute&&node.getAttribute(ATTR_NAMES[i]);var attrProductId=readProductId(attrValue);if(attrProductId)return attrProductId}var dataset=node.dataset||null;if(dataset){for(var j=0;j<DATASET_KEYS.length;j++){var dataValue=dataset[DATASET_KEYS[j]];var dataProductId=readProductId(dataValue);if(dataProductId)return dataProductId}}}return null}function isInlineMediaSlotElement(node){return !!(node&&node.getAttribute&&node.getAttribute("data-clippy-inline-media-slot")!==null)}function findInlineMediaSlot(start){for(var node=start;node&&node!==document.body;node=node.parentElement){if(isInlineMediaSlotElement(node))return node}return null}function readInlineMediaUrl(node){if(!node)return null;return node.getAttribute&&((node.getAttribute("data-clippy-inline-media-url")||node.getAttribute("data-url")||node.getAttribute("data_url")))||node.href||null}function stripHash(url){return String(url).replace(/#.*$/,"")}function urlsMatch(a,b){if(!a||!b)return false;try{return stripHash(new URL(a,loc).href)===stripHash(new URL(b,loc).href)}catch(_){return stripHash(a)===stripHash(b)}}function isFirstPartyReelUrl(value){try{var url=new URL(value,loc);if(url.protocol!=="https:")return false;var host=url.hostname.toLowerCase();var supported=host==="instagram.com"||host.endsWith(".instagram.com")||host==="facebook.com"||host.endsWith(".facebook.com");return supported&&/\/reels?\//i.test(url.pathname)}catch(_){return false}}function isInlineMediaUrlClick(node,href){var slot=findInlineMediaSlot(node);if(!slot)return false;var slotUrl=readInlineMediaUrl(slot);if(slotUrl)return urlsMatch(href,slotUrl);return isFirstPartyReelUrl(href)}function findDataHref(start){for(var node=start;node&&node!==document.body;node=node.parentElement){if(node.getAttribute){var href=node.getAttribute("data-href")||node.getAttribute("data-url");if(href)return{href:href,node:node}}}return null}var nativeOpen=window.open;window.open=function(url){if(parent!==window&&typeof url==="string"&&/^https?:\/\//.test(url)){parent.postMessage({type:"ecto:usercontent-link-click",href:url},"*");return null}return nativeOpen?nativeOpen.apply(window,arguments):null};document.addEventListener("click",function(e){var target=e.target instanceof Element?e.target:null;if(!target)return;if(parent===window)return;var a=target.closest?target.closest("a[href]"):null;if(a&&a.href&&/^https?:\/\//.test(a.href)&&a.href.replace(/#.*$/,"")!==loc){if(isInlineMediaUrlClick(a,a.href))return;var productId=extractProductId(target)||extractProductId(a);if(productId){e.preventDefault();parent.postMessage({type:"ecto-artifact-link-click",productId:productId},"*");return}e.preventDefault();parent.postMessage({type:"ecto:usercontent-link-click",href:a.href},"*");return}var dataHref=findDataHref(target);if(dataHref&&/^https?:\/\//.test(dataHref.href)&&dataHref.href.replace(/#.*$/,"")!==loc){if(isInlineMediaUrlClick(dataHref.node,dataHref.href))return;e.preventDefault();parent.postMessage({type:"ecto:usercontent-link-click",href:dataHref.href},"*")}},true)})();</script><script>(function(){var FOCUS_TYPE="ecto:artifact-focus-request";var CLOSE_TYPE="ecto:artifact-close-request";function focusArtifactDocument(){var body=document.body;if(!body)return;try{window.focus();}catch(e){}if(!body.hasAttribute("tabindex"))body.setAttribute("tabindex","-1");try{body.focus({preventScroll:true});}catch(e){try{body.focus();}catch(e2){}}}window.addEventListener("message",function(event){if(event.source!==window.parent)return;var data=event.data;if(!data||typeof data!=="object"||data.type!==FOCUS_TYPE)return;if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",focusArtifactDocument,{once:true});return;}focusArtifactDocument();});window.addEventListener("keydown",function(event){if(event.key!=="Escape")return;window.setTimeout(function(){if(event.defaultPrevented)return;window.parent.postMessage({type:CLOSE_TYPE},"*");},0);});})();</script></body>
 </html>
